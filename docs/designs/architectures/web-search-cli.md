@@ -370,7 +370,7 @@ flowchart TD
     J --> K[Daemon terminal logs and request loop]
 ```
 
-##### Step-by-Step Flow (pseudocode)
+##### Pseudocode
 
 ```text
 CLI Entrypoint:
@@ -426,7 +426,7 @@ flowchart TD
     N --> O[CLI stdout: result path]
 ```
 
-##### Step-by-Step Flow (pseudocode)
+##### Pseudocode
 
 ```text
 CLI Entrypoint:
@@ -517,7 +517,7 @@ flowchart TD
     O --> P[CLI stdout: result path]
 ```
 
-##### Step-by-Step Flow (pseudocode)
+##### Pseudocode
 
 ```text
 CLI Entrypoint:
@@ -619,7 +619,7 @@ flowchart TD
     Z --> AA
 ```
 
-##### Step-by-Step Flow (pseudocode)
+##### Pseudocode
 
 ```text
 CLI Entrypoint:
@@ -743,7 +743,7 @@ flowchart TD
     L --> M[CLI stdout: shutdown status]
 ```
 
-##### Step-by-Step Flow (pseudocode)
+##### Pseudocode
 
 ```text
 CLI Entrypoint:
