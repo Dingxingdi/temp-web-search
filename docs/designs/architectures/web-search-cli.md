@@ -15,18 +15,13 @@
 
 What this architecture intentionally does not cover, but could be addressed in the future:
 
-- Persistent URL state across daemon restarts.
-- Automatic daemon startup, background daemonization, `status`, force stop, and configurable shutdown timeouts.
 - Runtime LLM provider failover.
-- External plugin loading for arbitrary third-party providers.
-- Anthropic, Gemini, and OpenAI Responses adapters in the first version.
+- Anthropic, Gemini, and OpenAI Responses adapters.
 - MCP server transport using the same core orchestrators.
 - Direct arbitrary URL fetch without prior search admission.
-- Manual recovery or reset for URLs marked `available=false`.
 - Query-specific abstracts. `abstract` is a URL field and follows first-write semantics.
 - Structured CLI output modes such as `--json`.
 - Streaming progress events from daemon to CLI.
-- Persistent result-file indexing and cleanup policy.
 
 #### Assumptions
 
