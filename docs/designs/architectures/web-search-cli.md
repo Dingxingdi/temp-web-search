@@ -351,55 +351,67 @@ Important ownership boundary: provider adapters must not mutate `URL Store` dire
 
 ### 5. Data Flow
 
+Each flow below uses matching node IDs in the Mermaid diagram and pseudocode. A diagram branch label must appear as a concrete `if`, `else`, or `catch` branch in the pseudocode for the same node ID.
+
 #### 5.1 Entry Point 1: `web-search start`
 
 ##### Mermaid Diagram
 
 ```mermaid
 flowchart TD
-    A[web-search start] --> B[CLI Entrypoint]
-    B --> C[Foreground Daemon]
-    C --> D[Config Loader]
-    D --> E{Config and credentials valid?}
-    E -->|No| F[stderr + non-zero exit]
-    E -->|Yes| G[Provider Registry and Quota Manager]
-    G --> H[URL Store and Result Directory]
-    H --> I{Socket can be created?}
-    I -->|No| F
-    I -->|Yes| J[Socket Protocol listener]
-    J --> K[Daemon terminal logs and request loop]
+    ST1[ST1 CLI Entrypoint starts Foreground Daemon] --> ST2[ST2 Config Loader loads config and env]
+    ST2 --> ST3{ST3 Config and credentials valid?}
+    ST3 -->|No| ST_ERR[ST_ERR stderr + non-zero exit]
+    ST3 -->|Yes| ST4[ST4 Initialize providers, quotas, URL Store, result directory]
+    ST4 --> ST5{ST5 Socket can be created?}
+    ST5 -->|No| ST_ERR
+    ST5 -->|Yes| ST6[ST6 Socket listener and daemon request loop]
 ```
 
 ##### Pseudocode
 
 ```text
-CLI Entrypoint:
+ST1 CLI Entrypoint:
   call ForegroundDaemon.start()
+  goto ST2
 
-Foreground Daemon:
+ST2 Foreground Daemon + Config Loader:
   try:
     config = ConfigLoader.load("~/.config/web-search-cli/config.toml")
     ConfigLoader.resolve_environment_variables(config)
     ConfigLoader.validate_provider_capabilities(config)
     ConfigLoader.resolve_llm_stage_config(config)
+    goto ST3 with config_valid = true
   catch ConfigError as error:
-    CLI Entrypoint writes error to stderr
-    process exits non-zero
+    goto ST3 with config_valid = false
 
+ST3 Foreground Daemon:
+  if config_valid is false:
+    goto ST_ERR
+  else:
+    goto ST4
+
+ST4 Foreground Daemon:
   Provider Registry initializes enabled web and LLM adapters
   Provider Quota Manager creates web-provider and LLM-provider semaphores
   URL Store initializes empty in-memory URL state
   Result Writer ensures "~/.cache/web-search-cli/results/" exists
+  goto ST5
 
+ST5 Socket Protocol:
   try:
     Socket Protocol binds "~/.cache/web-search-cli/daemon.sock"
+    goto ST6
   catch SocketBindError as error:
-    Foreground Daemon logs startup failure
-    CLI Entrypoint writes error to stderr
-    process exits non-zero
+    goto ST_ERR
 
+ST6 Foreground Daemon:
   Foreground Daemon enters request loop
   Foreground Daemon writes progress and provider logs to daemon terminal
+
+ST_ERR CLI Entrypoint:
+  write concise error to stderr
+  exit non-zero
 ```
 
 #### 5.2 Entry Point 2: `web-search keyword-search QUERY`
@@ -408,88 +420,98 @@ Foreground Daemon:
 
 ```mermaid
 flowchart TD
-    A[web-search keyword-search QUERY] --> B[CLI Entrypoint]
-    B --> C{Query non-empty and daemon reachable?}
-    C -->|No| D[stderr + non-zero exit]
-    C -->|Yes| E[Socket Protocol: keyword_search]
-    E --> F[Foreground Daemon]
-    F --> G{Daemon accepting workflow requests?}
-    G -->|No| D
-    G -->|Yes| H[Search Orchestrator]
-    H --> I[KeywordSearchProvider adapters via Quota Manager]
-    I --> J{At least one provider pipeline completed?}
-    J -->|No| D
-    J -->|Yes| K[LLM Stages: cheap_check and judge optional body fields]
-    K --> L[URL Store admit / merge]
-    L --> M[Result Writer jsonl]
-    M --> N[Socket response: result path]
-    N --> O[CLI stdout: result path]
+    K1[K1 CLI Entrypoint validates query] --> K2{K2 Query non-empty?}
+    K2 -->|No| K_ERR[K_ERR stderr + non-zero exit]
+    K2 -->|Yes| K3[K3 Socket Protocol sends keyword_search]
+    K3 --> K4{K4 Daemon reachable?}
+    K4 -->|No| K_ERR
+    K4 -->|Yes| K5[K5 Foreground Daemon receives request]
+    K5 --> K6{K6 Daemon accepting workflow requests?}
+    K6 -->|No| K_ERR
+    K6 -->|Yes| K7[K7 Search Orchestrator runs providers, cheap_check, judge]
+    K7 --> K8{K8 At least one provider pipeline completed?}
+    K8 -->|No| K_ERR
+    K8 -->|Yes| K9[K9 URL Store admits / merges kept hits]
+    K9 --> K10[K10 Result Writer writes jsonl]
+    K10 --> K11[K11 Socket response contains result path]
+    K11 --> K12[K12 CLI stdout prints result path]
 ```
 
 ##### Pseudocode
 
 ```text
-CLI Entrypoint:
-  if QUERY is empty:
-    write error to stderr
-    exit non-zero
+K1 CLI Entrypoint:
+  validate QUERY
+  goto K2
 
+K2 CLI Entrypoint:
+  if QUERY is empty:
+    goto K_ERR
+  else:
+    goto K3
+
+K3 Socket Protocol:
   try:
     Socket Protocol sends {"type": "keyword_search", "query": QUERY}
+    goto K4 with daemon_reachable = true
   catch MissingDaemon:
-    write "Start the daemon with: web-search start" to stderr
-    exit non-zero
+    goto K4 with daemon_reachable = false
 
-Foreground Daemon:
+K4 CLI Entrypoint:
+  if daemon_reachable is false:
+    goto K_ERR
+  else:
+    goto K5
+
+K5 Foreground Daemon:
+  decode keyword_search request
+  goto K6
+
+K6 Foreground Daemon:
   if shutting_down:
-    return {"ok": false, "error": "daemon_shutting_down"}
+    goto K_ERR
+  else:
+    goto K7
 
-  return SearchOrchestrator.keyword_search(QUERY)
-
-Search Orchestrator:
+K7 Search Orchestrator + Provider Quota Manager:
   completed_pipelines = []
   kept_records = []
-
   for each enabled KeywordSearchProvider under Provider Quota Manager:
     try:
       hits = KeywordSearchProvider.search(QUERY)
-      completed_pipelines.append(provider)
-    catch ExecutionFailure as error:
-      Foreground Daemon logs provider failure
+      normalized_hits = Search Orchestrator derives abstract and discards empty-abstract hits
+      LLM Stages cheap_check and judge validate optional body fields
+      completed_pipelines.append({"provider": provider, "hits": normalized_hits})
+    catch ExecutionFailure:
+      Foreground Daemon logs provider pipeline failure
       continue
+  goto K8
 
-    for each hit in hits:
-      abstract = hit.snippet or hit.title
-      if abstract is empty:
-        continue
-
-      if hit.content or hit.raw_content:
-        candidate = hit.content if non-empty else hit.raw_content
-        if LLM Stages cheap_check rejects candidate:
-          do not write body fields
-        else if LLM Stages judge rejects candidate:
-          do not write body fields
-        else if LLM Stages judge fails by execution error:
-          mark provider pipeline failed
-          continue to next provider
-        else:
-          URL Store writes empty body fields using first-non-empty-wins
-
-      URL Store admits or merges URL with available=true by default
-      kept_records.append({"url": normalized_url, "abstract": stored_or_new_abstract})
-
+K8 Search Orchestrator:
   if completed_pipelines is empty:
-    return {"ok": false, "error": "all_providers_failed"}
-
-  result_path = Result Writer writes jsonl with only url and abstract
-  return {"ok": true, "text": result_path}
-
-CLI Entrypoint:
-  if response.ok:
-    print response.text to stdout
+    goto K_ERR
   else:
-    print response.message to stderr
-    exit non-zero
+    goto K9
+
+K9 URL Store:
+  admit or merge kept hits with first-non-empty-wins
+  existing available=false URLs may remain visible in this result
+  goto K10
+
+K10 Result Writer:
+  result_path = Result Writer writes jsonl with only url and abstract
+  goto K11
+
+K11 Socket Protocol:
+  send {"ok": true, "text": result_path}
+  goto K12
+
+K12 CLI Entrypoint:
+  print result_path to stdout
+
+K_ERR CLI Entrypoint:
+  print concise error to stderr
+  exit non-zero
 ```
 
 #### 5.3 Entry Point 3: `web-search llm-search PROMPT`
@@ -498,49 +520,62 @@ CLI Entrypoint:
 
 ```mermaid
 flowchart TD
-    A[web-search llm-search PROMPT] --> B[CLI Entrypoint]
-    B --> C{Prompt non-empty and daemon reachable?}
-    C -->|No| D[stderr + non-zero exit]
-    C -->|Yes| E[Socket Protocol: llm_search]
-    E --> F[Foreground Daemon]
-    F --> G{Daemon accepting workflow requests?}
-    G -->|No| D
-    G -->|Yes| H[Search Orchestrator]
-    H --> I[Configured search_llm provider entries]
-    I --> J[LLM Adapter calls via LLM Quota Manager]
-    J --> K{At least one LLM pipeline completed?}
-    K -->|No| D
-    K -->|Yes| L[Restricted Markdown Parser]
-    L --> M[URL Store admit / merge]
-    M --> N[Result Writer jsonl]
-    N --> O[Socket response: result path]
-    O --> P[CLI stdout: result path]
+    L1[L1 CLI Entrypoint validates prompt] --> L2{L2 Prompt non-empty?}
+    L2 -->|No| L_ERR[L_ERR stderr + non-zero exit]
+    L2 -->|Yes| L3[L3 Socket Protocol sends llm_search]
+    L3 --> L4{L4 Daemon reachable?}
+    L4 -->|No| L_ERR
+    L4 -->|Yes| L5[L5 Foreground Daemon receives request]
+    L5 --> L6{L6 Daemon accepting workflow requests?}
+    L6 -->|No| L_ERR
+    L6 -->|Yes| L7[L7 Search Orchestrator runs LLM calls and Markdown parser]
+    L7 --> L8{L8 At least one LLM pipeline completed?}
+    L8 -->|No| L_ERR
+    L8 -->|Yes| L9[L9 URL Store admits / merges parsed records]
+    L9 --> L10[L10 Result Writer writes jsonl]
+    L10 --> L11[L11 Socket response contains result path]
+    L11 --> L12[L12 CLI stdout prints result path]
 ```
 
 ##### Pseudocode
 
 ```text
-CLI Entrypoint:
-  if PROMPT is empty:
-    write error to stderr
-    exit non-zero
+L1 CLI Entrypoint:
+  validate PROMPT
+  goto L2
 
+L2 CLI Entrypoint:
+  if PROMPT is empty:
+    goto L_ERR
+  else:
+    goto L3
+
+L3 Socket Protocol:
   try:
     Socket Protocol sends {"type": "llm_search", "prompt": PROMPT}
+    goto L4 with daemon_reachable = true
   catch MissingDaemon:
-    write "Start the daemon with: web-search start" to stderr
-    exit non-zero
+    goto L4 with daemon_reachable = false
 
-Foreground Daemon:
+L4 CLI Entrypoint:
+  if daemon_reachable is false:
+    goto L_ERR
+  else:
+    goto L5
+
+L5 Foreground Daemon:
+  decode llm_search request
+  goto L6
+
+L6 Foreground Daemon:
   if shutting_down:
-    return {"ok": false, "error": "daemon_shutting_down"}
+    goto L_ERR
+  else:
+    goto L7
 
-  return SearchOrchestrator.llm_search(PROMPT)
-
-Search Orchestrator:
+L7 Search Orchestrator + LLM Adapter + LLM Provider Quota Manager:
   completed_pipelines = []
   parsed_records = []
-
   for each entry in [[search_llm.providers]]:
     try:
       LLM Adapter calls entry.provider under LLM Provider Quota Manager
@@ -552,26 +587,35 @@ Search Orchestrator:
     catch ExecutionFailure or ParserFailure as error:
       Foreground Daemon logs LLM search pipeline failure
       continue
+  goto L8
 
+L8 Search Orchestrator:
   if completed_pipelines is empty:
-    return {"ok": false, "error": "all_providers_failed"}
+    goto L_ERR
+  else:
+    goto L9
 
-  kept_records = []
+L9 URL Store:
   for each parsed_record in parsed_records:
     if parsed_record.abstract is empty:
       continue
     URL Store admits or merges URL with first-non-empty-wins
-    kept_records.append({"url": normalized_url, "abstract": stored_or_new_abstract})
+  goto L10
 
+L10 Result Writer:
   result_path = Result Writer writes jsonl with only url and abstract
-  return {"ok": true, "text": result_path}
+  goto L11
 
-CLI Entrypoint:
-  if response.ok:
-    print response.text to stdout
-  else:
-    print response.message to stderr
-    exit non-zero
+L11 Socket Protocol:
+  send {"ok": true, "text": result_path}
+  goto L12
+
+L12 CLI Entrypoint:
+  print result_path to stdout
+
+L_ERR CLI Entrypoint:
+  print concise error to stderr
+  exit non-zero
 ```
 
 #### 5.4 Entry Point 4: `web-search url-fetch URL [FOCUS]`
@@ -580,146 +624,194 @@ CLI Entrypoint:
 
 ```mermaid
 flowchart TD
-    A[web-search url-fetch URL FOCUS?] --> B[CLI Entrypoint]
-    B --> C{URL valid and daemon reachable?}
-    C -->|No| D[stderr + non-zero exit]
-    C -->|Yes| E[Socket Protocol: url_fetch]
-    E --> F[Foreground Daemon]
-    F --> G{Daemon accepting workflow requests?}
-    G -->|No| D
-    G -->|Yes| H[Fetch Orchestrator]
-    H --> I[URL Store read]
-    I --> J{Admitted and available?}
-    J -->|Not admitted| D
-    J -->|Unavailable| K[Socket response: unavailable message]
-    J -->|Available| L{Content ready?}
-    L -->|content exists| M[LLM Stages: safety]
-    L -->|raw_content only| N[LLM Stages: content_clean]
-    L -->|no body| O[Fetch Scheduler singleflight]
-    O --> P[URLFetchProvider adapters via Quota Manager]
-    P --> Q[LLM Stages: cheap_check and judge]
-    Q --> R{Provider candidate accepted?}
-    R -->|Execution failure only| D
-    R -->|Semantic failure only| S[URL Store mark unavailable]
-    R -->|Accepted| T[URL Store write first empty body fields]
-    N --> T
-    T --> M
-    M --> U{Safety passed?}
-    U -->|Execution failure| D
-    U -->|Rejected| S
-    U -->|Passed| V{Focus provided?}
-    V -->|No| W[Socket response: content]
-    V -->|Yes| X[LLM Stages: focus_summary]
-    X --> Y{Summary succeeded?}
-    Y -->|No| D
-    Y -->|Yes| Z[Socket response: focus summary]
-    K --> AA[CLI stdout]
-    S --> K
-    W --> AA
-    Z --> AA
+    U1[U1 CLI Entrypoint validates URL] --> U2{U2 URL valid?}
+    U2 -->|No| U_ERR[U_ERR stderr + non-zero exit]
+    U2 -->|Yes| U3[U3 Socket Protocol sends url_fetch]
+    U3 --> U4{U4 Daemon reachable?}
+    U4 -->|No| U_ERR
+    U4 -->|Yes| U5[U5 Foreground Daemon receives request]
+    U5 --> U6{U6 Daemon accepting workflow requests?}
+    U6 -->|No| U_ERR
+    U6 -->|Yes| U7[U7 Fetch Orchestrator reads URL Store]
+    U7 --> U8{U8 URL admitted?}
+    U8 -->|No| U_ERR
+    U8 -->|Yes| U9{U9 URL available?}
+    U9 -->|No| U_UNAVAILABLE[U_UNAVAILABLE Socket response unavailable]
+    U9 -->|Yes| U10{U10 Body state?}
+    U10 -->|content exists| U15[U15 LLM Stages safety]
+    U10 -->|raw_content only| U11[U11 LLM Stages content_clean]
+    U10 -->|no body| U12[U12 Fetch Scheduler runs providers, cheap_check, judge]
+    U11 --> U13{U13 Content clean succeeded?}
+    U13 -->|No| U_ERR
+    U13 -->|Yes| U15
+    U12 --> U14{U14 Fetch result?}
+    U14 -->|Execution failure only| U_ERR
+    U14 -->|Semantic failure only| U_MARK[U_MARK URL Store mark unavailable]
+    U14 -->|Accepted content| U15
+    U14 -->|Accepted raw_content| U11
+    U15 --> U16{U16 Safety result?}
+    U16 -->|Execution failure| U_ERR
+    U16 -->|Rejected| U_MARK
+    U16 -->|Passed| U17{U17 Focus provided?}
+    U17 -->|No| U_CONTENT[U_CONTENT Socket response content]
+    U17 -->|Yes| U18[U18 LLM Stages focus_summary]
+    U18 --> U19{U19 Focus summary succeeded?}
+    U19 -->|No| U_ERR
+    U19 -->|Yes| U_SUMMARY[U_SUMMARY Socket response focus summary]
+    U_MARK --> U_UNAVAILABLE
+    U_UNAVAILABLE --> U_OUT[U_OUT CLI stdout]
+    U_CONTENT --> U_OUT
+    U_SUMMARY --> U_OUT
 ```
 
 ##### Pseudocode
 
 ```text
-CLI Entrypoint:
-  if URL is invalid:
-    write error to stderr
-    exit non-zero
+U1 CLI Entrypoint:
+  validate URL syntax
+  goto U2
 
+U2 CLI Entrypoint:
+  if URL is invalid:
+    goto U_ERR
+  else:
+    goto U3
+
+U3 Socket Protocol:
   try:
     Socket Protocol sends {"type": "url_fetch", "url": URL, "focus": FOCUS_OR_NULL}
+    goto U4 with daemon_reachable = true
   catch MissingDaemon:
-    write "Start the daemon with: web-search start" to stderr
-    exit non-zero
+    goto U4 with daemon_reachable = false
 
-Foreground Daemon:
+U4 CLI Entrypoint:
+  if daemon_reachable is false:
+    goto U_ERR
+  else:
+    goto U5
+
+U5 Foreground Daemon:
+  decode url_fetch request
+  goto U6
+
+U6 Foreground Daemon:
   if shutting_down:
-    return {"ok": false, "error": "daemon_shutting_down"}
+    goto U_ERR
+  else:
+    goto U7
 
-  return FetchOrchestrator.url_fetch(URL, FOCUS_OR_NULL)
-
-Fetch Orchestrator:
+U7 Fetch Orchestrator + URL Store:
   normalized_url = URL normalizer normalizes URL
   url_object = URL Store.get(normalized_url)
+  goto U8
 
+U8 Fetch Orchestrator:
   if url_object is missing:
-    return {"ok": false, "error": "url_not_admitted"}
+    goto U_ERR
+  else:
+    goto U9
 
+U9 Fetch Orchestrator:
   if url_object.available is false:
-    return {"ok": true, "text": UNAVAILABLE_MESSAGE}
+    goto U_UNAVAILABLE
+  else:
+    goto U10
 
+U10 Fetch Orchestrator:
   acquire per-URL singleflight lock for normalized_url
+  if url_object.content is non-empty:
+    goto U15
+  else if url_object.raw_content is non-empty:
+    goto U11
+  else:
+    goto U12
 
-  if url_object.content is empty and url_object.raw_content is empty:
-    fetch_result = Fetch Scheduler.fetch_until_accepted(normalized_url)
+U11 LLM Stages:
+  try:
+    content = LLM Stages.content_clean(url_object.raw_content)
+    URL Store writes content if still empty
+    goto U13 with content_clean_succeeded = true
+  catch ExecutionFailure:
+    goto U13 with content_clean_succeeded = false
 
-    if fetch_result is pure execution failure:
-      return {"ok": false, "error": "all_providers_failed"}
+U13 Fetch Orchestrator:
+  if content_clean_succeeded is false:
+    goto U_ERR
+  else:
+    goto U15
 
-    if fetch_result is semantic failure with no success:
-      URL Store.mark_unavailable(normalized_url)
-      return {"ok": true, "text": UNAVAILABLE_MESSAGE}
+U12 Fetch Scheduler + URLFetchProvider adapters + Provider Quota Manager:
+  fetch_result = Fetch Scheduler.fetch_until_accepted(normalized_url)
+  goto U14
 
-    URL Store writes raw_content and optional content using first-non-empty-wins
+U14 Fetch Orchestrator:
+  if fetch_result is pure execution failure:
+    goto U_ERR
+  else if fetch_result is semantic failure with no success:
+    goto U_MARK
+  else if fetch_result includes accepted content:
+    URL Store writes raw_content and content using first-non-empty-wins
+    goto U15
+  else if fetch_result includes accepted raw_content only:
+    URL Store writes raw_content using first-non-empty-wins
+    goto U11
 
-  if url_object.content is empty and url_object.raw_content is non-empty:
-    try:
-      content = LLM Stages.content_clean(url_object.raw_content)
-      URL Store writes content if still empty
-    catch ExecutionFailure as error:
-      return {"ok": false, "error": "llm_stage_failed"}
-
+U15 LLM Stages:
   try:
     safety_result = LLM Stages.safety(url_object.content)
-  catch ExecutionFailure as error:
-    return {"ok": false, "error": "llm_stage_failed"}
+    goto U16 with safety_result
+  catch ExecutionFailure:
+    goto U16 with safety_result = "execution_failure"
 
-  if safety_result rejects:
-    URL Store.mark_unavailable(normalized_url)
-    return {"ok": true, "text": UNAVAILABLE_MESSAGE}
+U16 Fetch Orchestrator:
+  if safety_result is "execution_failure":
+    goto U_ERR
+  else if safety_result rejects:
+    goto U_MARK
+  else:
+    goto U17
 
+U17 Fetch Orchestrator:
   if FOCUS_OR_NULL is null:
-    return {"ok": true, "text": url_object.content}
+    goto U_CONTENT
+  else:
+    goto U18
 
+U18 LLM Stages:
   try:
     summary = LLM Stages.focus_summary(url_object.content, FOCUS_OR_NULL)
-    return {"ok": true, "text": summary}
-  catch ExecutionFailure as error:
-    return {"ok": false, "error": "llm_stage_failed"}
+    goto U19 with focus_summary_succeeded = true
+  catch ExecutionFailure:
+    goto U19 with focus_summary_succeeded = false
 
-Fetch Scheduler:
-  attempted_providers = []
-  semantic_failure_seen = false
-
-  while URLFetchProvider adapters remain unattempted:
-    provider = next provider with available Provider Quota Manager capacity
-    attempted_providers.append(provider)
-
-    try:
-      candidate = provider.fetch(normalized_url)
-      LLM Stages cheap_check and judge validate candidate
-    catch ExecutionFailure as error:
-      Foreground Daemon logs provider execution failure
-      continue
-
-    if cheap_check or judge semantically rejects candidate:
-      semantic_failure_seen = true
-      continue
-
-    return accepted candidate
-
-  if semantic_failure_seen:
-    return semantic failure with no success
-
-  return pure execution failure
-
-CLI Entrypoint:
-  if response.ok:
-    print response.text to stdout
+U19 Fetch Orchestrator:
+  if focus_summary_succeeded is false:
+    goto U_ERR
   else:
-    print response.message to stderr
-    exit non-zero
+    goto U_SUMMARY
+
+U_MARK URL Store:
+  URL Store.mark_unavailable(normalized_url)
+  goto U_UNAVAILABLE
+
+U_UNAVAILABLE Socket Protocol:
+  send {"ok": true, "text": UNAVAILABLE_MESSAGE}
+  goto U_OUT
+
+U_CONTENT Socket Protocol:
+  send {"ok": true, "text": url_object.content}
+  goto U_OUT
+
+U_SUMMARY Socket Protocol:
+  send {"ok": true, "text": summary}
+  goto U_OUT
+
+U_OUT CLI Entrypoint:
+  print response.text to stdout
+
+U_ERR CLI Entrypoint:
+  print concise error to stderr
+  exit non-zero
 ```
 
 #### 5.5 Entry Point 5: `web-search stop`
@@ -728,55 +820,79 @@ CLI Entrypoint:
 
 ```mermaid
 flowchart TD
-    A[web-search stop] --> B[CLI Entrypoint]
-    B --> C{Socket reachable?}
-    C -->|No| D[stdout: daemon is not running]
-    C -->|Yes| E[Socket Protocol: shutdown]
-    E --> F[Foreground Daemon]
-    F --> G[Mark shutting_down]
-    G --> H[Reject new workflow requests]
-    H --> I{Active requests complete before grace timeout?}
-    I -->|Yes| J[Close provider clients]
-    I -->|No| K[Cancel remaining request tasks]
-    K --> J
-    J --> L[Remove daemon socket and exit]
-    L --> M[CLI stdout: shutdown status]
+    P1[P1 CLI Entrypoint sends shutdown] --> P2{P2 Socket reachable?}
+    P2 -->|No| P_NOT_RUNNING[P_NOT_RUNNING stdout daemon is not running]
+    P2 -->|Yes| P3[P3 Foreground Daemon receives shutdown]
+    P3 --> P4{P4 Already shutting down?}
+    P4 -->|Yes| P_DONE[P_DONE CLI stdout shutdown status]
+    P4 -->|No| P5[P5 Mark shutting_down and reject new workflow requests]
+    P5 --> P6{P6 Active requests complete before grace timeout?}
+    P6 -->|No| P7[P7 Cancel remaining request tasks]
+    P6 -->|Yes| P8[P8 Close provider clients]
+    P7 --> P8
+    P8 --> P9[P9 Remove daemon socket and schedule process exit]
+    P9 --> P_DONE
 ```
 
 ##### Pseudocode
 
 ```text
-CLI Entrypoint:
+P1 CLI Entrypoint + Socket Protocol:
   try:
     Socket Protocol sends {"type": "shutdown"}
+    goto P2 with socket_reachable = true
   catch MissingDaemon:
-    print "Daemon is not running." to stdout
-    exit zero
+    goto P2 with socket_reachable = false
 
-Foreground Daemon:
+P2 CLI Entrypoint:
+  if socket_reachable is false:
+    goto P_NOT_RUNNING
+  else:
+    goto P3
+
+P3 Foreground Daemon:
+  decode shutdown request
+  goto P4
+
+P4 Foreground Daemon:
   if shutting_down:
-    return {"ok": true, "text": "Daemon stopped."}
+    goto P_DONE
+  else:
+    goto P5
 
+P5 Foreground Daemon:
   set shutting_down = true
   Socket Protocol stops accepting new workflow requests
   repeated shutdown requests remain accepted
+  goto P6
 
+P6 Foreground Daemon:
   try:
     wait for active workflow requests until grace timeout
+    goto P8
   catch GraceTimeout:
-    cancel remaining request tasks
+    goto P7
 
+P7 Foreground Daemon:
+  cancel remaining request tasks
+  goto P8
+
+P8 Foreground Daemon:
   close provider clients
+  goto P9
+
+P9 Foreground Daemon:
   remove "~/.cache/web-search-cli/daemon.sock"
   schedule process exit
-  return {"ok": true, "text": "Daemon stopped."}
+  goto P_DONE
 
-CLI Entrypoint:
-  if response.ok:
-    print response.text to stdout
-  else:
-    print response.message to stderr
-    exit non-zero
+P_DONE CLI Entrypoint:
+  print "Daemon stopped." to stdout
+  exit zero
+
+P_NOT_RUNNING CLI Entrypoint:
+  print "Daemon is not running." to stdout
+  exit zero
 ```
 
 ---
