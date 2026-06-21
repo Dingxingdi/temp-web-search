@@ -4,25 +4,33 @@
 
 #### In Scope
 
-- A first-version Python CLI and foreground daemon.
+- A first-version Python CLI and foreground daemon with manual start and graceful stop commands.
 - Three user-facing workflows: `keyword-search`, `llm-search`, and `url-fetch`.
 - In-memory URL state with the public five-field URL object: `url`, `raw_content`, `content`, `abstract`, `available`.
-- Keyword search and web fetch provider adapters based on the behavior in `useful_mcps`.
+- Keyword search and URL fetch provider adapters behind common contracts.
 - OpenAI-compatible chat-completions LLM calls using direct HTTP requests.
 - Provider-level concurrency control and per-URL fetch singleflight.
 
-#### Out of Scope
+#### Todo
+
+What this architecture intentionally does not cover, but could be addressed in the future:
 
 - Persistent URL state across daemon restarts.
-- Automatic daemon startup.
+- Automatic daemon startup, background daemonization, `status`, force stop, and configurable shutdown timeouts.
 - Runtime LLM provider failover.
 - External plugin loading for arbitrary third-party providers.
 - Anthropic, Gemini, and OpenAI Responses adapters in the first version.
+- MCP server transport using the same core orchestrators.
+- Direct arbitrary URL fetch without prior search admission.
+- Manual recovery or reset for URLs marked `available=false`.
 - Query-specific abstracts. `abstract` is a URL field and follows first-write semantics.
+- Structured CLI output modes such as `--json`.
+- Streaming progress events from daemon to CLI.
+- Persistent result-file indexing and cleanup policy.
 
 #### Assumptions
 
-- The user starts the daemon manually with `web-search daemon`.
+- The user starts the daemon manually with `web-search daemon` and stops it with `web-search stop`.
 - The daemon is the only owner of mutable URL state.
 - Network failures are treated as execution failures, not as URL semantics.
 - `available=false` is terminal for the daemon lifetime.
@@ -32,7 +40,7 @@
 
 ### 2. Architecture Summary
 
-The CLI is a thin client that sends one newline-delimited JSON request to a foreground daemon over a Unix domain socket. The daemon owns config, provider clients, concurrency controls, and in-memory URL state. Search commands call enabled providers, normalize and merge URL records, validate provider-supplied body fields before writing them, and emit a jsonl file containing only `url` and `abstract`. `url-fetch` only accepts URLs already admitted by search, prepares stable `content` through web fetch providers and LLM cleaning when needed, safety-checks final content, and returns either full content or a request-local focus summary.
+The CLI is a thin client that sends one newline-delimited JSON request to a foreground daemon over a Unix domain socket. The daemon owns config, provider clients, concurrency controls, and in-memory URL state. Search commands call enabled providers, normalize and merge URL records, validate provider-supplied body fields before writing them, and emit a jsonl file containing only `url` and `abstract`. `url-fetch` only accepts URLs already admitted by search, prepares stable `content` through URL fetch providers and LLM cleaning when needed, safety-checks final content, and returns either full content or a request-local focus summary. `stop` asks the daemon to shut itself down gracefully through the same socket protocol.
 
 ---
 
@@ -42,7 +50,7 @@ The CLI is a thin client that sends one newline-delimited JSON request to a fore
 
 ##### Foreground Daemon With Thin CLI
 
-- Description: Users run `web-search daemon` in one terminal. Other commands connect to `~/.cache/web-search-cli/daemon.sock`.
+- Description: Users run `web-search daemon` in one terminal. Other commands connect to `~/.cache/web-search-cli/daemon.sock`. `web-search stop` sends a shutdown request through that socket.
 
 - Rationale: This keeps CLI arguments small while preserving shared in-memory state across multiple CLI invocations.
 
@@ -56,11 +64,27 @@ The CLI is a thin client that sends one newline-delimited JSON request to a fore
     - Description: CLI starts the daemon when the socket is missing.
     - Why Rejected: First version would need stale socket handling, duplicate startup prevention, daemon log routing, and version checks.
 
+##### Graceful Stop Command
+
+- Description: `web-search stop` sends a `shutdown` request to the daemon. The daemon enters shutting-down state, stops accepting new workflow requests, lets active requests finish up to a fixed internal grace timeout, closes provider clients, removes the socket file, and exits.
+
+- Rationale: The daemon owns mutable in-memory state and provider clients, so it should shut itself down rather than be killed externally.
+
+- Trade-offs: A stop request can wait behind long-running active requests. If the grace timeout expires, remaining work is cancelled and callers may see execution or protocol errors.
+
+- Rejected Alternatives:
+  - Direct process kill:
+    - Description: Store a PID and have the CLI terminate it.
+    - Why Rejected: It bypasses cleanup and is less portable across future daemon implementations.
+  - Configurable stop flags:
+    - Description: Add options such as `--force`, `--timeout`, or `--no-wait`.
+    - Why Rejected: These are useful later, but they add CLI surface area before the first version needs it.
+
 ##### Python First Version
 
 - Description: Implement the first version with Python, `uv`, `argparse`, and `httpx`.
 
-- Rationale: The source project is Python, provider behavior can be reused quickly, and the first version is still exploring product semantics.
+- Rationale: Python keeps the first version fast to iterate on, especially while provider behavior and product semantics are still being finalized.
 
 - Trade-offs: Python distribution and long-running daemon ergonomics are weaker than a single Rust binary.
 
@@ -73,7 +97,7 @@ The CLI is a thin client that sends one newline-delimited JSON request to a fore
 
 ##### Single CLI Entry Point
 
-- Description: Use subcommands under one executable: `web-search daemon`, `web-search keyword-search`, `web-search llm-search`, and `web-search url-fetch`.
+- Description: Use subcommands under one executable: `web-search daemon`, `web-search stop`, `web-search keyword-search`, `web-search llm-search`, and `web-search url-fetch`.
 
 - Rationale: This matches common CLI shape and avoids globally generic command names such as `keyword-search`.
 
@@ -97,7 +121,7 @@ The CLI is a thin client that sends one newline-delimited JSON request to a fore
 
 ##### Plain Text Command Output
 
-- Description: Search commands print only the result jsonl path. `url-fetch` prints content or focus summary. Errors go to stderr with a non-zero exit code.
+- Description: Search commands print only the result jsonl path. `url-fetch` prints content or focus summary. `stop` prints a concise shutdown status. Errors go to stderr with a non-zero exit code.
 
 - Rationale: The successful output is easy to pipe into other tools and easy to read.
 
@@ -172,9 +196,9 @@ The CLI is a thin client that sends one newline-delimited JSON request to a fore
 
 ##### Adapter Protocols And Registry
 
-- Description: Core orchestration depends on `KeywordSearchProvider`, `WebFetchProvider`, and `LLMClient` interfaces. Provider-specific request and response mapping lives in adapters registered by name.
+- Description: Core orchestration depends on `KeywordSearchProvider`, `URLFetchProvider`, and `LLMClient` interfaces. Provider-specific request and response mapping lives in adapters registered by name.
 
-- Rationale: Keyword search providers and web fetch providers can change without changing orchestration logic.
+- Rationale: Keyword search providers and URL fetch providers can change without changing orchestration logic.
 
 - Trade-offs: First version still ships provider adapters in the repository; users cannot add a completely new provider by config alone.
 
@@ -212,7 +236,7 @@ The CLI is a thin client that sends one newline-delimited JSON request to a fore
 
 ##### Multiple Named LLM Providers
 
-- Description: Users may configure multiple named LLM providers, each with its own protocol, base URL, API-key environment variable, and concurrency limit. `[llm_search].providers` selects all LLM providers called concurrently for LLM search.
+- Description: Users may configure multiple named LLM providers, each with its own protocol, base URL, API-key environment variable, and concurrency limit. `[search_llm].providers` selects all LLM providers called concurrently for LLM search.
 
 - Rationale: Provider definitions stay separate from stage selection, so stages can change providers without changing adapter code.
 
@@ -220,9 +244,9 @@ The CLI is a thin client that sends one newline-delimited JSON request to a fore
 
 ##### First-Version Adapter Set
 
-- Description: Ship keyword search adapters for Tavily, Firecrawl, Exa, Linkup, Brave, AnySearch, and TinyFish. Ship web fetch adapters for Tavily, Firecrawl, Exa, Linkup, and TinyFish.
+- Description: Ship keyword search adapters for Tavily, Firecrawl, Exa, Linkup, Brave, AnySearch, and TinyFish. Ship URL fetch adapters for Tavily, Firecrawl, Exa, Linkup, and TinyFish.
 
-- Rationale: This matches the useful provider coverage already present in `useful_mcps`.
+- Rationale: This gives the first version coverage across both search-only and fetch-capable providers.
 
 - Trade-offs: More adapters must be tested and maintained in the first release.
 
@@ -248,15 +272,15 @@ The CLI is a thin client that sends one newline-delimited JSON request to a fore
 
 - Description: Concurrent `url-fetch` requests for the same normalized URL are serialized across the complete workflow, including body preparation, safety, and optional focus summary. Different URLs may run concurrently.
 
-- Rationale: This prevents duplicate web fetch provider calls, duplicate content cleaning, and conflicting safety mutations for the same URL.
+- Rationale: This prevents duplicate URL fetch provider calls, duplicate content cleaning, and conflicting safety mutations for the same URL.
 
 - Trade-offs: Different focus requests for the same URL wait for each other even though their summaries are request-local.
 
 ##### Fetch Provider Scheduler
 
-- Description: A URL fetch job is attempted by available web fetch providers one at a time. A provider candidate must pass cheap check and judge before fields are written. The first successful provider completes the job.
+- Description: A URL fetch job is attempted by available URL fetch providers one at a time. A provider candidate must pass cheap check and judge before fields are written. The first successful provider completes the job.
 
-- Rationale: This uses provider capacity efficiently without firing all web fetch providers for the same URL at once.
+- Rationale: This uses provider capacity efficiently without firing all URL fetch providers for the same URL at once.
 
 - Trade-offs: The scheduler is more complex than a fixed provider order.
 
@@ -314,14 +338,14 @@ The CLI is a thin client that sends one newline-delimited JSON request to a fore
 |---|---|---|---|---|---|---|
 | CLI Entrypoint | Give users one command surface | Parse subcommands, encode requests, connect to socket, render success/errors | `web-search <subcommand>` | `argparse`, socket protocol | No | Source / renderer |
 | Socket Protocol | Define daemon boundary | Read/write newline-delimited JSON, validate envelope shape | `send_request`, `read_response` | JSON, Unix socket | No | Boundary |
-| Foreground Daemon | Own runtime process | Create socket, load config, initialize providers, dispatch requests | NDJSON request handler | Config loader, orchestrators, stores | Yes, process lifecycle | Coordinator |
+| Foreground Daemon | Own runtime process | Create socket, load config, initialize providers, dispatch requests, handle graceful shutdown | NDJSON request handler | Config loader, orchestrators, stores | Yes, process lifecycle | Coordinator |
 | Config Loader | Turn TOML and env into runtime config | Validate provider support, resolve API key envs, concurrency defaults, LLM stage inheritance | `load_config()` | TOML parser, environment | No | Validator / transformer |
 | URL Store | Hold admitted URL objects | Normalize keys, merge first non-empty fields, track `available` | `get`, `admit`, `merge`, `mark_unavailable` | URL normalizer | Yes, URL objects | Store |
 | Search Orchestrator | Implement keyword and LLM search workflows | Call providers, validate optional body fields, aggregate, write jsonl | `keyword_search(query)`, `llm_search(prompt)` | Provider registry, URL store, LLM stages, result writer | No | Coordinator |
 | Fetch Orchestrator | Implement URL fetch workflow | Enforce admitted URL rule, prepare content, run safety, run focus summary | `url_fetch(url, focus=None)` | URL store, fetch scheduler, LLM stages | No | Coordinator |
 | Fetch Scheduler | Efficiently fetch missing page bodies | Singleflight by URL, dispatch provider attempts, classify semantic vs execution results | `fetch_until_accepted(url)` | Fetch providers, provider quotas, cheap check, judge | Yes, in-flight jobs | Scheduler |
 | Provider Quota Manager | Enforce provider max concurrency | Provide shared web-provider semaphores and separate LLM semaphores | `acquire(provider_name)` | Config | Yes, semaphores | Gate |
-| Web Provider Adapters | Isolate provider APIs | Map provider-specific keyword search and web fetch endpoints into common hit/result objects | `search(query)`, `fetch(url)` | `httpx`, provider config | No | Adapter |
+| Web Provider Adapters | Isolate provider APIs | Map provider-specific keyword search and URL fetch endpoints into common hit/result objects | `search(query)`, `fetch(url)` | `httpx`, provider config | No | Adapter |
 | LLM Adapter | Isolate OpenAI-compatible API | Build chat-completions POST body, merge `extra_body`, parse text/JSON | `complete_text`, `complete_json` | `httpx`, LLM config, quota manager | No | Adapter |
 | LLM Stages | Provide prompt-level behavior | Judge crawl success, safety-check content, clean content, summarize focus, parse LLM search Markdown | stage functions | LLM adapter, prompts | No | Validator / transformer |
 | Result Writer | Produce user-visible search files | Write jsonl lines with `url` and `abstract` only | `write_results(kind, records)` | File system | No | Sink |
@@ -340,10 +364,11 @@ flowchart TD
     B --> C[Foreground Daemon]
     C --> D[Search Orchestrator]
     C --> E[Fetch Orchestrator]
+    C --> P[Shutdown Controller]
     D --> F[Web Search Providers]
     D --> G[LLM Search Providers]
     E --> H[Fetch Scheduler]
-    H --> I[Web Fetch Providers]
+    H --> I[URL Fetch Providers]
     D --> J[LLM Stages]
     E --> J
     J --> K[OpenAI-Compatible LLM Adapter]
@@ -352,6 +377,7 @@ flowchart TD
     D --> M[Result Jsonl Writer]
     M --> N[~/.cache/web-search-cli/results]
     E --> O[CLI Text Output]
+    P --> Q[Socket Cleanup And Process Exit]
 ```
 
 #### 5.2 Keyword Search Flow
@@ -372,7 +398,7 @@ flowchart TD
 #### 5.3 LLM Search Flow
 
 1. CLI sends `{ "type": "llm_search", "prompt": "..." }`.
-2. The search orchestrator calls all providers listed in `[llm_search].providers`.
+2. The search orchestrator calls all providers listed in `[search_llm].providers`.
 3. Each provider uses the OpenAI-compatible LLM adapter and may receive stage `extra_body`.
 4. The model is prompted to return restricted Markdown blocks:
 
@@ -401,16 +427,26 @@ flowchart TD
 9. After `content` exists, safety runs on final content.
 10. Without focus, content is returned. With focus, focus-summary runs and its result is returned without caching.
 
-#### 5.5 Failure Flow
+#### 5.5 Stop Flow
+
+1. CLI sends `{ "type": "shutdown" }`.
+2. If no daemon is running, `web-search stop` succeeds and prints that the daemon is not running.
+3. If the daemon is running, it marks itself as shutting down and stops accepting new workflow requests.
+4. Existing search and fetch requests continue until completion or until the daemon's fixed internal grace timeout expires.
+5. The daemon closes provider clients, removes `~/.cache/web-search-cli/daemon.sock`, and exits.
+6. The stop command prints a concise shutdown status. It does not clear result jsonl files because those are user-visible command outputs.
+
+#### 5.6 Failure Flow
 
 - Invalid input: The daemon rejects empty queries, malformed URLs, unknown request types, and URLs not admitted by search with an error response.
-- Provider timeout or malformed response: This is an execution failure for that provider pipeline. Other keyword search providers or web fetch providers may continue.
+- Shutdown state: Once shutdown begins, new workflow requests are rejected with a shutting-down error if they reach the daemon before the socket is removed.
+- Provider timeout or malformed response: This is an execution failure for that provider pipeline. Other keyword search providers or URL fetch providers may continue.
 - Search provider partial failure: If at least one provider pipeline completes, the command can produce jsonl. If all fail by execution error, the command errors.
 - Body validation rejection: Cheap check or judge rejection is semantic failure. In search, the URL can still be kept with abstract only. In fetch, if no provider succeeds and at least one semantic failure occurred, mark `available=false`.
 - Safety rejection: Mark `available=false` and return unavailable.
 - Safety/content-clean/focus execution failure: Return an error and do not mark `available=false`.
 - Concurrent fetch for same URL: Later requests join the existing singleflight job and then read the resulting URL state.
-- Missing daemon: CLI prints an instruction to start `web-search daemon` and exits non-zero.
+- Missing daemon: Workflow commands print an instruction to start `web-search daemon` and exit non-zero; `stop` exits zero and reports that the daemon is not running.
 
 ---
 
@@ -436,6 +472,10 @@ Public, migration-stable socket requests:
 {"type":"url_fetch","url":"https://example.com/page","focus":"pricing details"}
 ```
 
+```json
+{"type":"shutdown"}
+```
+
 Public, migration-stable socket responses:
 
 ```json
@@ -447,7 +487,15 @@ Public, migration-stable socket responses:
 ```
 
 ```json
+{"ok":true,"text":"Daemon stopped."}
+```
+
+```json
 {"ok":false,"error":"daemon_not_ready","message":"Start the daemon with: web-search daemon"}
+```
+
+```json
+{"ok":false,"error":"daemon_shutting_down","message":"Daemon is shutting down"}
 ```
 
 #### Domain Object Contract
@@ -485,7 +533,7 @@ Internal `KeywordSearchProvider` result:
 }
 ```
 
-Internal `WebFetchProvider` result:
+Internal `URLFetchProvider` result:
 
 ```json
 {
@@ -494,7 +542,7 @@ Internal `WebFetchProvider` result:
 }
 ```
 
-`raw_content` is required and non-empty for a successful `WebFetchProvider` result. `content` is optional. If both are returned, `content` is the validation candidate; when it passes, both fields may be written.
+`raw_content` is required and non-empty for a successful `URLFetchProvider` result. `content` is optional. If both are returned, `content` is the validation candidate; when it passes, both fields may be written.
 
 Internal LLM stage contract:
 
@@ -528,16 +576,16 @@ default_max_concurrency = 2
 
 [llm_providers.openai_main]
 protocol = "openai"
-api_style = "chat_completions"
+api_endpoint = "chat_completions"
 api_url = "https://api.openai.com"
 api_key_env = "OPENAI_API_KEY"
 max_concurrency = 2
 
-[llm]
+[global_default_llm]
 provider = "openai_main"
 model = "gpt-4o-mini"
 
-[llm_search]
+[search_llm]
 providers = ["openai_main"]
 model = "gpt-4o-search-preview"
 extra_body = { web_search_options = { search_context_size = "high" } }
@@ -566,8 +614,8 @@ Rules:
 - Web-provider `max_concurrency` falls back to `[web_providers].default_max_concurrency`.
 - LLM-provider `max_concurrency` falls back to `[llm_providers].default_max_concurrency`.
 - Every LLM stage may override provider, model, protocol options, and `extra_body`.
-- LLM search resolves stage settings from `[llm_search]` and then `[llm]`.
-- Judge, safety, content-clean, and focus-summary resolve stage settings from their stage table, then `[fetch_llm]`, then `[llm]`.
+- LLM search resolves stage settings from `[search_llm]` and then `[global_default_llm]`.
+- Judge, safety, content-clean, and focus-summary resolve stage settings from their stage table, then `[fetch_llm]`, then `[global_default_llm]`.
 
 #### Result Jsonl Contract
 

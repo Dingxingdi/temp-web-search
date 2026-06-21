@@ -20,10 +20,18 @@ Primary rule:
 
 ### 2. CLI And Socket Errors
 
-#### Missing Daemon
+#### Missing Daemon For Workflow Commands
 
+- Applies to: `keyword-search`, `llm-search`, `url-fetch`.
 - Condition: CLI cannot connect to `~/.cache/web-search-cli/daemon.sock`.
 - Handling: Print an instruction to start `web-search daemon` to stderr and exit non-zero.
+- State: No state changes.
+
+#### Missing Daemon For Stop
+
+- Applies to: `stop`.
+- Condition: CLI cannot connect to `~/.cache/web-search-cli/daemon.sock`.
+- Handling: Treat as success. Print `Daemon is not running.` to stdout and exit zero.
 - State: No state changes.
 
 #### Malformed Socket Response
@@ -37,6 +45,18 @@ Primary rule:
 - Condition: Daemon receives invalid newline-delimited JSON or an unknown request type.
 - Handling: Return `{ "ok": false, "error": "bad_request", "message": "..." }`.
 - State: No state changes.
+
+#### Daemon Is Shutting Down
+
+- Condition: Daemon has accepted a shutdown request and receives a new workflow request before the socket is removed.
+- Handling: Return `{ "ok": false, "error": "daemon_shutting_down", "message": "Daemon is shutting down" }`; CLI writes the message to stderr and exits non-zero.
+- State: No URL field changes.
+
+#### Repeated Stop During Shutdown
+
+- Condition: Daemon has accepted a shutdown request and receives another `shutdown` request before the socket is removed.
+- Handling: Treat as success. Return a concise shutdown-in-progress response.
+- State: No URL field changes.
 
 ---
 
@@ -115,12 +135,12 @@ Handling:
 - If at least one LLM search provider pipeline completes, the command writes jsonl, even if no results were parsed.
 - If all configured LLM search provider pipelines fail, the command errors.
 
-#### Web Fetch Provider Pipeline
+#### URL Fetch Provider Pipeline
 
 Pipeline:
 
 ```text
-web fetch provider HTTP call
+URL fetch provider HTTP call
 -> provider response parsing
 -> candidate selection
 -> cheap_check
@@ -129,9 +149,9 @@ web fetch provider HTTP call
 
 Handling:
 
-- HTTP timeout, transport error, retry exhaustion, malformed provider response, empty execution result, or judge execution failure marks this web fetch provider attempt as execution failure.
+- HTTP timeout, transport error, retry exhaustion, malformed provider response, empty execution result, or judge execution failure marks this URL fetch provider attempt as execution failure.
 - `cheap_check` rejection or judge `ok=false` marks this provider attempt as semantic failure.
-- The fetch scheduler can try another web fetch provider after either kind of failed attempt.
+- The fetch scheduler can try another URL fetch provider after either kind of failed attempt.
 
 Final no-success rule:
 
@@ -186,7 +206,7 @@ All external HTTP and LLM calls use configurable retry with exponential backoff.
 - Fill `content` only if empty and candidate body validation or content-clean succeeded.
 - Set `available=false` only for semantic rejection:
   - safety `ok=false`;
-  - no web fetch provider succeeds and at least one provider attempt semantically rejected the candidate.
+  - no URL fetch provider succeeds and at least one provider attempt semantically rejected the candidate.
 
 #### Forbidden Mutations
 
@@ -206,6 +226,7 @@ All external HTTP and LLM calls use configurable retry with exponential backoff.
 - `web-search llm-search ...`: stdout contains only the jsonl path.
 - `web-search url-fetch URL`: stdout contains content or unavailable message.
 - `web-search url-fetch URL FOCUS`: stdout contains focus summary or unavailable message.
+- `web-search stop`: stdout contains `Daemon stopped.` when it stopped a running daemon, or `Daemon is not running.` when no daemon was running.
 
 #### Error
 
@@ -247,10 +268,11 @@ Socket responses should use stable internal error codes even if CLI renders huma
 | `url_not_admitted` | URL was not emitted by prior search |
 | `no_keyword_search_providers` | No enabled keyword search providers |
 | `no_llm_search_providers` | No configured LLM search providers |
-| `no_web_fetch_providers` | No enabled web fetch providers and no stored body |
+| `no_url_fetch_providers` | No enabled URL fetch providers and no stored body |
 | `all_providers_failed` | All relevant provider pipelines failed by execution error |
 | `llm_stage_failed` | A required LLM stage failed after retries |
 | `protocol_error` | Socket or provider protocol response was malformed |
 | `config_error` | Daemon config is invalid |
+| `daemon_shutting_down` | Daemon is rejecting new workflow requests because shutdown has started |
 
 Unavailable semantic responses should not use an error code in successful responses unless the CLI later gains structured output.

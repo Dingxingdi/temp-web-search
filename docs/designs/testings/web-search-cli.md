@@ -2,7 +2,7 @@
 
 ### 1. Test Strategy
 
-The first version should treat tests as executable confirmation of the design, not as provider-integration smoke tests. Most tests should use fake `KeywordSearchProvider`, fake `WebFetchProvider`, fake LLM clients, and in-memory daemon state.
+The first version should treat tests as executable confirmation of the design, not as provider-integration smoke tests. Most tests should use fake `KeywordSearchProvider`, fake `URLFetchProvider`, fake LLM clients, and in-memory daemon state.
 
 Primary goals:
 
@@ -22,7 +22,7 @@ Primary goals:
 | Unit tests | Validate pure functions and small components | No | URL normalization, Markdown parsing, config resolution |
 | Orchestrator tests | Validate search/fetch state transitions | No | Duplicate URL merge, `available=false`, body validation |
 | Scheduler tests | Validate concurrency and provider worker behavior | No | Same URL singleflight, different URL concurrency |
-| Protocol tests | Validate CLI/daemon JSON contract | No | NDJSON framing, response rendering |
+| Protocol tests | Validate CLI/daemon JSON contract and daemon lifecycle control | No | NDJSON framing, response rendering, graceful shutdown |
 | Adapter parser tests | Validate provider response mapping | No | Tavily/Exa/Firecrawl sample JSON parsing |
 | Optional integration tests | Manual or opt-in real provider checks | Yes, opt-in only | Real Tavily search, real OpenAI-compatible LLM call |
 
@@ -70,8 +70,8 @@ Cover:
 - Missing API key environment variables fail daemon config validation.
 - Web-provider concurrency defaults and provider overrides resolve correctly.
 - LLM-provider concurrency defaults and provider overrides resolve correctly.
-- LLM search resolves from `[llm_search]` then `[llm]`.
-- Judge/safety/content-clean/focus-summary resolve from stage table, then `[fetch_llm]`, then `[llm]`.
+- LLM search resolves from `[search_llm]` then `[global_default_llm]`.
+- Judge/safety/content-clean/focus-summary resolve from stage table, then `[fetch_llm]`, then `[global_default_llm]`.
 - `extra_body` is allowed on every LLM stage and passed through without core interpretation.
 - Enabling an unsupported provider stage fails startup validation.
 
@@ -104,7 +104,7 @@ Cover:
 Cover:
 
 - No configured LLM search providers returns `no_llm_search_providers`.
-- All configured `[llm_search].providers` are called.
+- All configured `[search_llm].providers` are called.
 - Partial LLM search provider execution failure still writes results from successful pipelines.
 - A successful provider that parses zero results still counts as completed.
 - All LLM search provider pipelines failing produces `all_providers_failed`.
@@ -121,11 +121,11 @@ Cover:
 - Invalid URL returns `invalid_url`.
 - URL not emitted by search returns `url_not_admitted` and exits as error at CLI layer.
 - `available=false` returns the stable unavailable message without provider or LLM calls.
-- Existing `content` skips web fetch and content-clean, but still runs safety before returning.
+- Existing `content` skips URL fetch and content-clean, but still runs safety before returning.
 - Existing `raw_content` with empty `content` runs content-clean, writes `content`, then safety.
 - Focus request runs safety first, then focus-summary, and does not cache focus output.
 
-#### Web Fetch Provider Attempts
+#### URL Fetch Provider Attempts
 
 Cover:
 
@@ -155,7 +155,7 @@ Cover:
 
 Cover:
 
-- Two concurrent `url-fetch` calls for the same URL trigger one web fetch provider attempt.
+- Two concurrent `url-fetch` calls for the same URL trigger one URL fetch provider attempt.
 - Waiting callers receive the same resulting content or unavailable/error result.
 - Same-URL requests serialize safety/content-clean/focus workflow.
 - Different URLs can run concurrently.
@@ -164,10 +164,10 @@ Cover:
 
 Cover:
 
-- A web provider's keyword search and web fetch share one semaphore.
+- A web provider's keyword search and URL fetch share one semaphore.
 - LLM providers use separate semaphores from web providers.
 - Provider `max_concurrency` is respected under concurrent requests.
-- Scheduler never runs the same URL through two web fetch providers at the same time.
+- Scheduler never runs the same URL through two URL fetch providers at the same time.
 - When one provider is saturated, another available provider can process a different URL job.
 
 Use controllable fake providers with async events to prove ordering without sleeping.
@@ -185,6 +185,20 @@ Cover:
 - Partial request bytes are buffered until newline.
 - Invalid JSON produces `bad_request`.
 - Response objects are encoded as one line.
+- `shutdown` is a valid request type.
+
+#### Daemon Lifecycle
+
+Cover:
+
+- `web-search stop` sends a `shutdown` request over the configured socket.
+- A running daemon enters shutting-down state after accepting `shutdown`.
+- New workflow requests received during shutdown return `daemon_shutting_down`.
+- A repeated `shutdown` request during shutdown succeeds.
+- Active requests are allowed to complete before daemon exit when they finish within the fixed grace timeout.
+- Active requests are cancelled when the fixed grace timeout expires.
+- Daemon shutdown closes provider clients and removes `~/.cache/web-search-cli/daemon.sock`.
+- URL state is not persisted across daemon restart after stop.
 
 #### CLI Rendering
 
@@ -192,8 +206,10 @@ Cover:
 
 - Successful search prints only jsonl path to stdout.
 - Successful `url-fetch` prints only content, summary, or unavailable message to stdout.
+- Successful `stop` prints only a concise shutdown status to stdout.
 - Error responses print message to stderr, stdout is empty, exit code is non-zero.
-- Missing daemon prints instruction to run `web-search daemon`.
+- Missing daemon prints instruction to run `web-search daemon` for workflow commands.
+- Missing daemon for `stop` exits zero and prints that the daemon is not running.
 
 ---
 
@@ -209,7 +225,7 @@ For each shipped `KeywordSearchProvider` adapter, test response parsing with rep
 - AnySearch
 - TinyFish
 
-For each shipped `WebFetchProvider` adapter, test response parsing with representative sample payloads:
+For each shipped `URLFetchProvider` adapter, test response parsing with representative sample payloads:
 
 - Tavily
 - Firecrawl
@@ -232,7 +248,7 @@ Adapter tests should verify:
 Use these fake components:
 
 - `FakeKeywordSearchProvider`: returns configured hits or raises configured exception.
-- `FakeWebFetchProvider`: returns configured fetch result, semantic candidate, or raises configured exception.
+- `FakeURLFetchProvider`: returns configured fetch result, semantic candidate, or raises configured exception.
 - `FakeLLMClient`: records stage calls and returns configured text/JSON.
 - `ControlledProvider`: blocks on async events to test semaphore and scheduler ordering.
 - Temporary cache/config directories: isolate `~/.cache` and `~/.config` behavior.
