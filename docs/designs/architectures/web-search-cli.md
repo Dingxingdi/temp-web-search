@@ -351,9 +351,9 @@ Important ownership boundary: provider adapters must not mutate `URL Store` dire
 
 ### 5. Data Flow
 
-#### 5.1 User Request Flow
+#### 5.1 Entry Point 1: `web-search start`
 
-##### Start Daemon Request
+##### Mermaid Diagram
 
 ```mermaid
 flowchart TD
@@ -370,7 +370,41 @@ flowchart TD
     J --> K[Daemon terminal logs and request loop]
 ```
 
-##### Keyword Search Request
+##### Step-by-Step Flow (pseudocode)
+
+```text
+CLI Entrypoint:
+  call ForegroundDaemon.start()
+
+Foreground Daemon:
+  try:
+    config = ConfigLoader.load("~/.config/web-search-cli/config.toml")
+    ConfigLoader.resolve_environment_variables(config)
+    ConfigLoader.validate_provider_capabilities(config)
+    ConfigLoader.resolve_llm_stage_config(config)
+  catch ConfigError as error:
+    CLI Entrypoint writes error to stderr
+    process exits non-zero
+
+  Provider Registry initializes enabled web and LLM adapters
+  Provider Quota Manager creates web-provider and LLM-provider semaphores
+  URL Store initializes empty in-memory URL state
+  Result Writer ensures "~/.cache/web-search-cli/results/" exists
+
+  try:
+    Socket Protocol binds "~/.cache/web-search-cli/daemon.sock"
+  catch SocketBindError as error:
+    Foreground Daemon logs startup failure
+    CLI Entrypoint writes error to stderr
+    process exits non-zero
+
+  Foreground Daemon enters request loop
+  Foreground Daemon writes progress and provider logs to daemon terminal
+```
+
+#### 5.2 Entry Point 2: `web-search keyword-search QUERY`
+
+##### Mermaid Diagram
 
 ```mermaid
 flowchart TD
@@ -392,7 +426,75 @@ flowchart TD
     N --> O[CLI stdout: result path]
 ```
 
-##### LLM Search Request
+##### Step-by-Step Flow (pseudocode)
+
+```text
+CLI Entrypoint:
+  if QUERY is empty:
+    write error to stderr
+    exit non-zero
+
+  try:
+    Socket Protocol sends {"type": "keyword_search", "query": QUERY}
+  catch MissingDaemon:
+    write "Start the daemon with: web-search start" to stderr
+    exit non-zero
+
+Foreground Daemon:
+  if shutting_down:
+    return {"ok": false, "error": "daemon_shutting_down"}
+
+  return SearchOrchestrator.keyword_search(QUERY)
+
+Search Orchestrator:
+  completed_pipelines = []
+  kept_records = []
+
+  for each enabled KeywordSearchProvider under Provider Quota Manager:
+    try:
+      hits = KeywordSearchProvider.search(QUERY)
+      completed_pipelines.append(provider)
+    catch ExecutionFailure as error:
+      Foreground Daemon logs provider failure
+      continue
+
+    for each hit in hits:
+      abstract = hit.snippet or hit.title
+      if abstract is empty:
+        continue
+
+      if hit.content or hit.raw_content:
+        candidate = hit.content if non-empty else hit.raw_content
+        if LLM Stages cheap_check rejects candidate:
+          do not write body fields
+        else if LLM Stages judge rejects candidate:
+          do not write body fields
+        else if LLM Stages judge fails by execution error:
+          mark provider pipeline failed
+          continue to next provider
+        else:
+          URL Store writes empty body fields using first-non-empty-wins
+
+      URL Store admits or merges URL with available=true by default
+      kept_records.append({"url": normalized_url, "abstract": stored_or_new_abstract})
+
+  if completed_pipelines is empty:
+    return {"ok": false, "error": "all_providers_failed"}
+
+  result_path = Result Writer writes jsonl with only url and abstract
+  return {"ok": true, "text": result_path}
+
+CLI Entrypoint:
+  if response.ok:
+    print response.text to stdout
+  else:
+    print response.message to stderr
+    exit non-zero
+```
+
+#### 5.3 Entry Point 3: `web-search llm-search PROMPT`
+
+##### Mermaid Diagram
 
 ```mermaid
 flowchart TD
@@ -415,7 +517,66 @@ flowchart TD
     O --> P[CLI stdout: result path]
 ```
 
-##### URL Fetch Request
+##### Step-by-Step Flow (pseudocode)
+
+```text
+CLI Entrypoint:
+  if PROMPT is empty:
+    write error to stderr
+    exit non-zero
+
+  try:
+    Socket Protocol sends {"type": "llm_search", "prompt": PROMPT}
+  catch MissingDaemon:
+    write "Start the daemon with: web-search start" to stderr
+    exit non-zero
+
+Foreground Daemon:
+  if shutting_down:
+    return {"ok": false, "error": "daemon_shutting_down"}
+
+  return SearchOrchestrator.llm_search(PROMPT)
+
+Search Orchestrator:
+  completed_pipelines = []
+  parsed_records = []
+
+  for each entry in [[search_llm.providers]]:
+    try:
+      LLM Adapter calls entry.provider under LLM Provider Quota Manager
+      LLM Adapter sends entry.model and entry.extra_body
+      markdown = LLM Adapter returns text
+      records = Restricted Markdown Parser parses Result / URL / Abstract blocks
+      completed_pipelines.append(entry)
+      parsed_records.extend(records)
+    catch ExecutionFailure or ParserFailure as error:
+      Foreground Daemon logs LLM search pipeline failure
+      continue
+
+  if completed_pipelines is empty:
+    return {"ok": false, "error": "all_providers_failed"}
+
+  kept_records = []
+  for each parsed_record in parsed_records:
+    if parsed_record.abstract is empty:
+      continue
+    URL Store admits or merges URL with first-non-empty-wins
+    kept_records.append({"url": normalized_url, "abstract": stored_or_new_abstract})
+
+  result_path = Result Writer writes jsonl with only url and abstract
+  return {"ok": true, "text": result_path}
+
+CLI Entrypoint:
+  if response.ok:
+    print response.text to stdout
+  else:
+    print response.message to stderr
+    exit non-zero
+```
+
+#### 5.4 Entry Point 4: `web-search url-fetch URL [FOCUS]`
+
+##### Mermaid Diagram
 
 ```mermaid
 flowchart TD
@@ -458,7 +619,112 @@ flowchart TD
     Z --> AA
 ```
 
-##### Stop Daemon Request
+##### Step-by-Step Flow (pseudocode)
+
+```text
+CLI Entrypoint:
+  if URL is invalid:
+    write error to stderr
+    exit non-zero
+
+  try:
+    Socket Protocol sends {"type": "url_fetch", "url": URL, "focus": FOCUS_OR_NULL}
+  catch MissingDaemon:
+    write "Start the daemon with: web-search start" to stderr
+    exit non-zero
+
+Foreground Daemon:
+  if shutting_down:
+    return {"ok": false, "error": "daemon_shutting_down"}
+
+  return FetchOrchestrator.url_fetch(URL, FOCUS_OR_NULL)
+
+Fetch Orchestrator:
+  normalized_url = URL normalizer normalizes URL
+  url_object = URL Store.get(normalized_url)
+
+  if url_object is missing:
+    return {"ok": false, "error": "url_not_admitted"}
+
+  if url_object.available is false:
+    return {"ok": true, "text": UNAVAILABLE_MESSAGE}
+
+  acquire per-URL singleflight lock for normalized_url
+
+  if url_object.content is empty and url_object.raw_content is empty:
+    fetch_result = Fetch Scheduler.fetch_until_accepted(normalized_url)
+
+    if fetch_result is pure execution failure:
+      return {"ok": false, "error": "all_providers_failed"}
+
+    if fetch_result is semantic failure with no success:
+      URL Store.mark_unavailable(normalized_url)
+      return {"ok": true, "text": UNAVAILABLE_MESSAGE}
+
+    URL Store writes raw_content and optional content using first-non-empty-wins
+
+  if url_object.content is empty and url_object.raw_content is non-empty:
+    try:
+      content = LLM Stages.content_clean(url_object.raw_content)
+      URL Store writes content if still empty
+    catch ExecutionFailure as error:
+      return {"ok": false, "error": "llm_stage_failed"}
+
+  try:
+    safety_result = LLM Stages.safety(url_object.content)
+  catch ExecutionFailure as error:
+    return {"ok": false, "error": "llm_stage_failed"}
+
+  if safety_result rejects:
+    URL Store.mark_unavailable(normalized_url)
+    return {"ok": true, "text": UNAVAILABLE_MESSAGE}
+
+  if FOCUS_OR_NULL is null:
+    return {"ok": true, "text": url_object.content}
+
+  try:
+    summary = LLM Stages.focus_summary(url_object.content, FOCUS_OR_NULL)
+    return {"ok": true, "text": summary}
+  catch ExecutionFailure as error:
+    return {"ok": false, "error": "llm_stage_failed"}
+
+Fetch Scheduler:
+  attempted_providers = []
+  semantic_failure_seen = false
+
+  while URLFetchProvider adapters remain unattempted:
+    provider = next provider with available Provider Quota Manager capacity
+    attempted_providers.append(provider)
+
+    try:
+      candidate = provider.fetch(normalized_url)
+      LLM Stages cheap_check and judge validate candidate
+    catch ExecutionFailure as error:
+      Foreground Daemon logs provider execution failure
+      continue
+
+    if cheap_check or judge semantically rejects candidate:
+      semantic_failure_seen = true
+      continue
+
+    return accepted candidate
+
+  if semantic_failure_seen:
+    return semantic failure with no success
+
+  return pure execution failure
+
+CLI Entrypoint:
+  if response.ok:
+    print response.text to stdout
+  else:
+    print response.message to stderr
+    exit non-zero
+```
+
+#### 5.5 Entry Point 5: `web-search stop`
+
+##### Mermaid Diagram
 
 ```mermaid
 flowchart TD
@@ -477,70 +743,41 @@ flowchart TD
     L --> M[CLI stdout: shutdown status]
 ```
 
-#### 5.2 Step-by-Step Flow
+##### Step-by-Step Flow (pseudocode)
 
-##### `web-search start`
+```text
+CLI Entrypoint:
+  try:
+    Socket Protocol sends {"type": "shutdown"}
+  catch MissingDaemon:
+    print "Daemon is not running." to stdout
+    exit zero
 
-1. The CLI entrypoint runs the foreground daemon process rather than sending a socket request.
-2. The daemon loads `~/.config/web-search-cli/config.toml`, resolves environment variables, validates provider capabilities, and resolves LLM stage configuration.
-3. If config validation, credential resolution, or provider initialization fails, startup prints a concise error and exits non-zero without creating mutable URL state.
-4. The daemon creates provider clients, provider quota semaphores, an empty in-memory URL store, and the result directory if needed.
-5. The daemon attempts to bind `~/.cache/web-search-cli/daemon.sock`. If the socket cannot be created, startup fails with a clear error.
-6. On success, the daemon listens for newline-delimited JSON requests, writes logs to the daemon terminal, and remains the only owner of URL state until shutdown.
+Foreground Daemon:
+  if shutting_down:
+    return {"ok": true, "text": "Daemon stopped."}
 
-##### `web-search keyword-search QUERY`
+  set shutting_down = true
+  Socket Protocol stops accepting new workflow requests
+  repeated shutdown requests remain accepted
 
-1. The CLI validates that `QUERY` is non-empty and connects to `~/.cache/web-search-cli/daemon.sock`; missing daemon is a CLI error that tells the user to run `web-search start`.
-2. The CLI sends `{ "type": "keyword_search", "query": "..." }` through the socket protocol.
-3. The daemon rejects the request if it is shutting down; otherwise it dispatches to the search orchestrator.
-4. The search orchestrator runs enabled `KeywordSearchProvider` adapters under their shared web-provider quotas. Provider execution failures are isolated to that provider pipeline.
-5. If all keyword search provider pipelines fail by execution error, the daemon returns an error response.
-6. For completed provider pipelines, the orchestrator derives `abstract = snippet or title`; hits with empty abstract are discarded.
-7. Provider-supplied `content` or `raw_content` is written only after cheap check and judge accept it. Semantic body rejection prevents body-field writes but can still keep the URL with abstract.
-8. The URL store admits or merges each kept URL with first non-empty wins. Existing `available=false` records may still be included in this search result.
-9. The result writer writes a jsonl file containing only `url` and `abstract`.
-10. The daemon returns the result path; the CLI prints only that path to stdout. Error responses print to stderr and exit non-zero.
+  try:
+    wait for active workflow requests until grace timeout
+  catch GraceTimeout:
+    cancel remaining request tasks
 
-##### `web-search llm-search PROMPT`
+  close provider clients
+  remove "~/.cache/web-search-cli/daemon.sock"
+  schedule process exit
+  return {"ok": true, "text": "Daemon stopped."}
 
-1. The CLI validates that `PROMPT` is non-empty and connects to the daemon socket; missing daemon is a CLI error that tells the user to run `web-search start`.
-2. The CLI sends `{ "type": "llm_search", "prompt": "..." }`.
-3. The daemon rejects the request if it is shutting down; otherwise it dispatches to the search orchestrator.
-4. The search orchestrator runs each `[[search_llm.providers]]` entry as an independent LLM search pipeline. Each entry uses its referenced LLM provider, model, and `extra_body`.
-5. LLM calls run through the `LLM Adapter` under the referenced LLM provider's quota. Pipeline execution failures do not stop other LLM search pipelines.
-6. Each successful pipeline is parsed by the restricted Markdown parser, which reads only `## Result`, `URL:`, and `Abstract:` fields. Malformed required fields fail that pipeline.
-7. If all LLM search pipelines fail by execution error, the daemon returns an error response. A completed pipeline with zero parsed results is still a completed pipeline.
-8. Parsed records go through the same URL admission, first-write merge, abstract requirement, and jsonl writer path as keyword search.
-9. The daemon returns the result path; the CLI prints only that path to stdout. Error responses print to stderr and exit non-zero.
-
-##### `web-search url-fetch URL [FOCUS]`
-
-1. The CLI validates that `URL` is syntactically valid and connects to the daemon socket; missing daemon is a CLI error that tells the user to run `web-search start`.
-2. The CLI sends `{ "type": "url_fetch", "url": "...", "focus": null }` or the same request with a non-empty `focus`.
-3. The daemon rejects the request if it is shutting down; otherwise it dispatches to the fetch orchestrator.
-4. The fetch orchestrator normalizes the URL and reads the URL store. A missing URL is `url_not_admitted` and returns an error, not an unavailable response.
-5. If `available=false`, the daemon returns the stable unavailable message without provider or LLM calls.
-6. If `content` exists, the fetch orchestrator skips URL fetch and content-clean, then runs safety on `content`.
-7. If `content` is empty and `raw_content` exists, content-clean runs through the LLM stages. Successful clean output writes `content`; execution failure returns an error without marking unavailable.
-8. If both body fields are empty, the fetch orchestrator creates or joins the per-URL singleflight job in the fetch scheduler.
-9. The fetch scheduler tries URL fetch providers one at a time as provider quota is available. Each candidate must pass cheap check and judge before body fields are written.
-10. If all provider attempts fail only by execution failure, `url-fetch` returns an error and does not mark `available=false`.
-11. If no provider succeeds and at least one provider attempt semantically rejects the candidate, the URL store marks `available=false` and returns the unavailable message.
-12. Once `content` exists, safety runs on final content. Safety execution failure returns an error; safety rejection marks `available=false` and returns the unavailable message.
-13. If safety passes and no focus is provided, the daemon returns full `content`.
-14. If focus is provided, focus-summary runs through the LLM stages and returns summary text only. Focus-summary output is never cached; focus-summary execution failure is an error and does not return full content as fallback.
-15. The CLI prints content, focus summary, or unavailable message to stdout for successful responses. Error responses print to stderr and exit non-zero.
-
-##### `web-search stop`
-
-1. The CLI attempts to connect to `~/.cache/web-search-cli/daemon.sock`.
-2. If no daemon is reachable, `stop` is treated as already satisfied: the CLI prints `Daemon is not running.` and exits zero.
-3. If the daemon is reachable, the CLI sends `{ "type": "shutdown" }`.
-4. The daemon marks itself as shutting down, accepts repeated shutdown requests, and rejects new workflow requests with `daemon_shutting_down`.
-5. Active workflow requests continue until they complete or until the fixed internal grace timeout expires.
-6. If the grace timeout expires, the daemon cancels remaining request tasks; those callers may see execution or protocol errors.
-7. The daemon closes provider clients, removes `~/.cache/web-search-cli/daemon.sock`, and exits.
-8. The stop command prints a concise shutdown status. It does not delete result jsonl files or persist/clear URL state beyond process exit.
+CLI Entrypoint:
+  if response.ok:
+    print response.text to stdout
+  else:
+    print response.message to stderr
+    exit non-zero
+```
 
 ---
 
