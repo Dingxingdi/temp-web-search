@@ -70,9 +70,11 @@ Cover:
 - Missing API key environment variables fail daemon config validation.
 - Web-provider concurrency defaults and provider overrides resolve correctly.
 - LLM-provider concurrency defaults and provider overrides resolve correctly.
-- LLM search resolves from `[search_llm]` then `[global_default_llm]`.
+- LLM search resolves each `[[search_llm.providers]]` entry independently and may fall back to `[global_default_llm].model` for missing model only.
+- Each LLM search entry preserves its own `provider`, `model`, and `extra_body`.
 - Judge/safety/content-clean/focus-summary resolve from stage table, then `[fetch_llm]`, then `[global_default_llm]`.
 - `extra_body` is allowed on every LLM stage and passed through without core interpretation.
+- `extra_body` for one LLM search entry is not shared with any other entry.
 - Enabling an unsupported provider stage fails startup validation.
 
 ---
@@ -104,7 +106,8 @@ Cover:
 Cover:
 
 - No configured LLM search providers returns `no_llm_search_providers`.
-- All configured `[search_llm].providers` are called.
+- All configured `[[search_llm.providers]]` entries are called.
+- Each LLM search entry is called with its own configured model and `extra_body`.
 - Partial LLM search provider execution failure still writes results from successful pipelines.
 - A successful provider that parses zero results still counts as completed.
 - All LLM search provider pipelines failing produces `all_providers_failed`.
@@ -208,7 +211,7 @@ Cover:
 - Successful `url-fetch` prints only content, summary, or unavailable message to stdout.
 - Successful `stop` prints only a concise shutdown status to stdout.
 - Error responses print message to stderr, stdout is empty, exit code is non-zero.
-- Missing daemon prints instruction to run `web-search daemon` for workflow commands.
+- Missing daemon prints instruction to run `web-search start` for workflow commands.
 - Missing daemon for `stop` exits zero and prints that the daemon is not running.
 
 ---

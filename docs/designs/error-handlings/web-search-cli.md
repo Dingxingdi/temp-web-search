@@ -24,7 +24,7 @@ Primary rule:
 
 - Applies to: `keyword-search`, `llm-search`, `url-fetch`.
 - Condition: CLI cannot connect to `~/.cache/web-search-cli/daemon.sock`.
-- Handling: Print an instruction to start `web-search daemon` to stderr and exit non-zero.
+- Handling: Print an instruction to start `web-search start` to stderr and exit non-zero.
 - State: No state changes.
 
 #### Missing Daemon For Stop

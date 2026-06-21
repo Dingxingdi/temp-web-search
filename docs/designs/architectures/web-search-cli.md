@@ -25,7 +25,7 @@ What this architecture intentionally does not cover, but could be addressed in t
 
 #### Assumptions
 
-- The user starts the daemon manually with `web-search daemon` and stops it with `web-search stop`.
+- The user starts the daemon manually with `web-search start` and stops it with `web-search stop`.
 - The daemon is the only owner of mutable URL state.
 - Network failures are treated as execution failures, not as URL semantics.
 - `available=false` is terminal for the daemon lifetime.
@@ -45,7 +45,7 @@ The CLI is a thin client that sends one newline-delimited JSON request to a fore
 
 ##### Foreground Daemon With Thin CLI
 
-- Description: Users run `web-search daemon` in one terminal. Other commands connect to `~/.cache/web-search-cli/daemon.sock`. `web-search stop` sends a shutdown request through that socket.
+- Description: Users run `web-search start` in one terminal. Other commands connect to `~/.cache/web-search-cli/daemon.sock`. `web-search stop` sends a shutdown request through that socket.
 
 - Rationale: This keeps CLI arguments small while preserving shared in-memory state across multiple CLI invocations.
 
@@ -92,7 +92,7 @@ The CLI is a thin client that sends one newline-delimited JSON request to a fore
 
 ##### Single CLI Entry Point
 
-- Description: Use subcommands under one executable: `web-search daemon`, `web-search stop`, `web-search keyword-search`, `web-search llm-search`, and `web-search url-fetch`.
+- Description: Use subcommands under one executable: `web-search start`, `web-search stop`, `web-search keyword-search`, `web-search llm-search`, and `web-search url-fetch`.
 
 - Rationale: This matches common CLI shape and avoids globally generic command names such as `keyword-search`.
 
@@ -231,11 +231,11 @@ The CLI is a thin client that sends one newline-delimited JSON request to a fore
 
 ##### Multiple Named LLM Providers
 
-- Description: Users may configure multiple named LLM providers, each with its own protocol, base URL, API-key environment variable, and concurrency limit. `[search_llm].providers` selects all LLM providers called concurrently for LLM search.
+- Description: Users may configure multiple named LLM providers, each with its own protocol, base URL, API-key environment variable, and concurrency limit. `[[search_llm.providers]]` entries select the LLM search pipelines to call concurrently, with each entry carrying its own `provider`, `model`, and `extra_body`.
 
-- Rationale: Provider definitions stay separate from stage selection, so stages can change providers without changing adapter code.
+- Rationale: Transport-level provider definitions stay separate from stage-level invocation settings. The same LLM backend can be reused by different stages or search pipelines with different models and provider-specific request bodies.
 
-- Trade-offs: Configuration validation must resolve provider references and reject missing or incompatible definitions.
+- Trade-offs: Configuration validation must resolve each search entry, reject missing or incompatible provider references, and preserve per-entry request settings in logs and errors.
 
 ##### First-Version Adapter Set
 
@@ -393,8 +393,8 @@ flowchart TD
 #### 5.3 LLM Search Flow
 
 1. CLI sends `{ "type": "llm_search", "prompt": "..." }`.
-2. The search orchestrator calls all providers listed in `[search_llm].providers`.
-3. Each provider uses the OpenAI-compatible LLM adapter and may receive stage `extra_body`.
+2. The search orchestrator calls all entries listed under `[[search_llm.providers]]`.
+3. Each entry uses its referenced LLM provider adapter with that entry's own `model` and `extra_body`.
 4. The model is prompted to return restricted Markdown blocks:
 
    ```markdown
@@ -441,7 +441,7 @@ flowchart TD
 - Safety rejection: Mark `available=false` and return unavailable.
 - Safety/content-clean/focus execution failure: Return an error and do not mark `available=false`.
 - Concurrent fetch for same URL: Later requests join the existing singleflight job and then read the resulting URL state.
-- Missing daemon: Workflow commands print an instruction to start `web-search daemon` and exit non-zero; `stop` exits zero and reports that the daemon is not running.
+- Missing daemon: Workflow commands print an instruction to start `web-search start` and exit non-zero; `stop` exits zero and reports that the daemon is not running.
 
 ---
 
@@ -486,7 +486,7 @@ Public, migration-stable socket responses:
 ```
 
 ```json
-{"ok":false,"error":"daemon_not_ready","message":"Start the daemon with: web-search daemon"}
+{"ok":false,"error":"daemon_not_ready","message":"Start the daemon with: web-search start"}
 ```
 
 ```json
@@ -580,10 +580,15 @@ max_concurrency = 2
 provider = "openai_main"
 model = "gpt-4o-mini"
 
-[search_llm]
-providers = ["openai_main"]
+[[search_llm.providers]]
+provider = "openai_main"
 model = "gpt-4o-search-preview"
 extra_body = { web_search_options = { search_context_size = "high" } }
+
+[[search_llm.providers]]
+provider = "openai_main"
+model = "gpt-4o-mini-search"
+extra_body = { web_search_options = { search_context_size = "medium" } }
 
 [fetch_llm]
 provider = "openai_main"
@@ -609,7 +614,10 @@ Rules:
 - Web-provider `max_concurrency` falls back to `[web_providers].default_max_concurrency`.
 - LLM-provider `max_concurrency` falls back to `[llm_providers].default_max_concurrency`.
 - Every LLM stage may override provider, model, protocol options, and `extra_body`.
-- LLM search resolves stage settings from `[search_llm]` and then `[global_default_llm]`.
+- LLM search is configured as one or more `[[search_llm.providers]]` entries.
+- Each LLM search entry must reference a configured `[llm_providers.<name>]`.
+- Each LLM search entry carries its own `model` and optional `extra_body`; `extra_body` is not shared across LLM search entries.
+- LLM search entry `model` may fall back to `[global_default_llm].model` if omitted, but explicit per-entry models are preferred.
 - Judge, safety, content-clean, and focus-summary resolve stage settings from their stage table, then `[fetch_llm]`, then `[global_default_llm]`.
 
 #### Result Jsonl Contract
